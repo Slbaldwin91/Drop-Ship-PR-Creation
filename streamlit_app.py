@@ -13,12 +13,75 @@ VENDOR_COLUMN = "Vendor"
 OUTPUT_COLUMNS = [VENDOR_COLUMN, PO_COLUMN, INVENTORY_COLUMN, "Row Number"]
 
 
+def clean_header(value):
+    if value is None:
+        return ""
+    return str(value).replace("\ufeff", "").strip()
+
+
+def find_header_row_from_excel(data):
+    """
+    Find the actual column-header row instead of assuming row 1.
+
+    This handles vendor workbooks that put a report title, date range,
+    or other information above the real headers.
+    """
+    preview = pd.read_excel(
+        io.BytesIO(data),
+        header=None,
+        dtype=str,
+        keep_default_na=False,
+        nrows=20,
+    )
+
+    required_markers = {PO_COLUMN, INVENTORY_COLUMN}
+
+    for idx, row in preview.iterrows():
+        values = {clean_header(v) for v in row.tolist()}
+        if required_markers.issubset(values):
+            return idx
+
+    return None
+
+
+def read_uploaded_file(uploaded_file):
+    data = uploaded_file.getvalue()
+    suffix = Path(uploaded_file.name).suffix.lower()
+
+    if suffix == ".csv":
+        # CSV files normally have the headers on their first row.
+        return pd.read_csv(
+            io.BytesIO(data),
+            dtype=str,
+            keep_default_na=False,
+        )
+
+    if suffix in {".xlsx", ".xlsm"}:
+        header_row = find_header_row_from_excel(data)
+
+        if header_row is None:
+            raise ValueError(
+                "I could not find the actual header row. The workbook must "
+                f"contain '{PO_COLUMN}' and '{INVENTORY_COLUMN}' as column names."
+            )
+
+        return pd.read_excel(
+            io.BytesIO(data),
+            header=header_row,
+            dtype=str,
+            keep_default_na=False,
+        )
+
+    raise ValueError("Please upload a CSV, XLSX, or XLSM file.")
+
+
 def normalize_digits(value, width, field_name, row_number):
     if pd.isna(value) or str(value).strip() == "":
         raise ValueError(f"Row {row_number}: {field_name} is blank.")
 
     text = str(value).strip()
 
+    # Excel/pandas can represent an integer-looking value as 12345.0.
     if re.fullmatch(r"\d+\.0+", text):
         text = text.split(".", 1)[0]
 
@@ -37,32 +100,25 @@ def normalize_digits(value, width, field_name, row_number):
     return text.zfill(width)
 
 
-def read_uploaded_file(uploaded_file):
-    data = uploaded_file.getvalue()
-    suffix = Path(uploaded_file.name).suffix.lower()
-
-    if suffix == ".csv":
-        return pd.read_csv(
-            io.BytesIO(data),
-            dtype=str,
-            keep_default_na=False,
-        )
-
-    if suffix in {".xlsx", ".xlsm"}:
-        return pd.read_excel(
-            io.BytesIO(data),
-            dtype=str,
-            keep_default_na=False,
-        )
-
-    raise ValueError("Please upload a CSV, XLSX, or XLSM file.")
-
-
 def transform(df, vendor_id=None):
+    # Strip whitespace/BOM from imported headers without changing the
+    # required field names used by the Acumatica import.
+    df = df.copy()
+    df.columns = [clean_header(c) for c in df.columns]
+
+    # Vendor workbooks may contain formatted-but-empty rows below the data.
+    # Remove only rows that are completely empty; do not hide partially
+    # populated rows because those need to be reported as data errors.
+    df = df.loc[~df.apply(
+        lambda row: all(str(v).strip() == "" for v in row),
+        axis=1
+    )].reset_index(drop=True)
+
     missing = [
         c for c in (PO_COLUMN, INVENTORY_COLUMN)
         if c not in df.columns
     ]
+
     if missing:
         raise ValueError(
             "The uploaded file is missing required column(s): "
@@ -74,6 +130,7 @@ def transform(df, vendor_id=None):
             return None, "VENDOR_REQUIRED"
 
         df[VENDOR_COLUMN] = vendor_id.strip()
+
     elif vendor_id and vendor_id.strip():
         df[VENDOR_COLUMN] = (
             df[VENDOR_COLUMN]
@@ -89,14 +146,17 @@ def transform(df, vendor_id=None):
 
     result = pd.DataFrame()
     result[VENDOR_COLUMN] = df[VENDOR_COLUMN].astype(str).str.strip()
+
     result[PO_COLUMN] = [
         normalize_digits(v, 6, PO_COLUMN, i)
         for i, v in enumerate(df[PO_COLUMN], start=1)
     ]
+
     result[INVENTORY_COLUMN] = [
         normalize_digits(v, 8, INVENTORY_COLUMN, i)
         for i, v in enumerate(df[INVENTORY_COLUMN], start=1)
     ]
+
     result["Row Number"] = range(1, len(result) + 1)
 
     return result[OUTPUT_COLUMNS], None
@@ -105,6 +165,7 @@ def transform(df, vendor_id=None):
 def make_excel(df):
     buffer = io.BytesIO()
 
+    # Write identifier columns as strings.
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(
             writer,
@@ -117,10 +178,11 @@ def make_excel(df):
     ws = wb["Shipping Confirmations"]
 
     header_map = {
-        cell.value: cell.column
+        clean_header(cell.value): cell.column
         for cell in ws[1]
     }
 
+    # Explicit Excel text format prevents leading zeroes from disappearing.
     for field in (PO_COLUMN, INVENTORY_COLUMN):
         col = header_map[field]
         for row in range(2, ws.max_row + 1):
@@ -134,6 +196,7 @@ def make_excel(df):
         INVENTORY_COLUMN: 16,
         "Row Number": 14,
     }
+
     for cell in ws[1]:
         if cell.value in widths:
             ws.column_dimensions[cell.column_letter].width = widths[cell.value]
@@ -151,13 +214,14 @@ st.set_page_config(
 )
 
 st.title("📦 Acumatica Drop-Ship Converter")
+
 st.write(
     "Convert a vendor shipping-confirmation CSV or Excel file into "
     "an Acumatica-ready Excel file."
 )
 
 st.info(
-    "Required fields: **Vendor**, **Drop-Ship PO Nbr:**, "
+    "Required output fields: **Vendor**, **Drop-Ship PO Nbr:**, "
     "**Inventory ID**, and **Row Number**."
 )
 
@@ -172,7 +236,8 @@ if uploaded:
         source = read_uploaded_file(uploaded)
 
         st.caption(
-            f"Loaded **{len(source):,} row(s)** from `{uploaded.name}`."
+            f"Loaded **{len(source):,} non-empty row(s)** from `{uploaded.name}`. "
+            "The converter automatically finds the actual header row in Excel files."
         )
 
         vendor_missing = VENDOR_COLUMN not in source.columns
@@ -187,8 +252,12 @@ if uploaded:
                 "Vendor ID",
                 placeholder="Enter Vendor ID",
             )
+
         else:
-            blank_vendor = source[VENDOR_COLUMN].astype(str).str.strip().eq("").any()
+            blank_vendor = (
+                source[VENDOR_COLUMN].astype(str).str.strip().eq("").any()
+            )
+
             if blank_vendor:
                 st.warning(
                     "The Vendor column contains blank rows. "
