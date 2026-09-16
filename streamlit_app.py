@@ -101,66 +101,79 @@ def normalize_digits(value, width, field_name, row_number):
 
 
 def transform(df, vendor_id=None):
-    # Strip whitespace/BOM from imported headers without changing the
-    # required field names used by the Acumatica import.
     df = df.copy()
     df.columns = [clean_header(c) for c in df.columns]
 
-    # Vendor workbooks may contain formatted-but-empty rows below the data.
-    # Remove only rows that are completely empty; do not hide partially
-    # populated rows because those need to be reported as data errors.
-    df = df.loc[~df.apply(
-        lambda row: all(str(v).strip() == "" for v in row),
-        axis=1
-    )].reset_index(drop=True)
+    # Ignore completely blank rows.
+    df = df.loc[
+        ~df.apply(lambda row: all(str(v).strip() == "" for v in row), axis=1)
+    ].reset_index(drop=True)
 
-    missing = [
-        c for c in (PO_COLUMN, INVENTORY_COLUMN)
-        if c not in df.columns
-    ]
-
+    missing = [c for c in (PO_COLUMN, INVENTORY_COLUMN) if c not in df.columns]
     if missing:
-        raise ValueError(
-            "The uploaded file is missing required column(s): "
-            + ", ".join(repr(c) for c in missing)
-        )
+        raise ValueError("Missing required column(s): " + ", ".join(missing))
+
+    original_columns = list(df.columns)
 
     if VENDOR_COLUMN not in df.columns:
-        if not vendor_id or not vendor_id.strip():
-            return None, "VENDOR_REQUIRED"
+        if not vendor_id:
+            return None, "VENDOR_REQUIRED", None
+        df[VENDOR_COLUMN] = vendor_id
+    else:
+        df[VENDOR_COLUMN] = df[VENDOR_COLUMN].astype(str).str.strip()
+        if vendor_id:
+            df.loc[df[VENDOR_COLUMN] == "", VENDOR_COLUMN] = vendor_id
 
-        df[VENDOR_COLUMN] = vendor_id.strip()
-
-    elif vendor_id and vendor_id.strip():
-        df[VENDOR_COLUMN] = (
-            df[VENDOR_COLUMN]
-            .replace("", pd.NA)
-            .fillna(vendor_id.strip())
-        )
-
-    if df[VENDOR_COLUMN].astype(str).str.strip().eq("").any():
+    blank_vendor = df[VENDOR_COLUMN].astype(str).str.strip() == ""
+    if blank_vendor.any():
+        rows = (df.index[blank_vendor] + 2).tolist()
         raise ValueError(
-            "The Vendor column contains blank values. "
-            "Enter a Vendor ID to fill the blanks."
+            "Vendor is blank on source Excel row(s): " +
+            ", ".join(map(str, rows))
         )
 
-    result = pd.DataFrame()
-    result[VENDOR_COLUMN] = df[VENDOR_COLUMN].astype(str).str.strip()
+    valid_records = []
+    exception_records = []
 
-    result[PO_COLUMN] = [
-        normalize_digits(v, 6, PO_COLUMN, i)
-        for i, v in enumerate(df[PO_COLUMN], start=1)
-    ]
+    for idx, row in df.iterrows():
+        source_row_number = idx + 2
+        po_raw = str(row[PO_COLUMN]).strip()
+        inv_raw = str(row[INVENTORY_COLUMN]).strip()
 
-    result[INVENTORY_COLUMN] = [
-        normalize_digits(v, 8, INVENTORY_COLUMN, i)
-        for i, v in enumerate(df[INVENTORY_COLUMN], start=1)
-    ]
+        # PO values containing non-numeric characters, or more than 6 digits,
+        # are excluded from the Acumatica import and copied in full to the
+        # exception workbook.
+        if not po_raw.isdigit() or len(po_raw) > 6:
+            exception_records.append(row[original_columns].to_dict())
+            continue
 
-    result["Row Number"] = range(1, len(result) + 1)
+        if not inv_raw.isdigit():
+            raise ValueError(
+                f"Inventory ID is invalid on source Excel row {source_row_number}: "
+                f"{inv_raw!r}. Inventory ID must contain digits only."
+            )
 
-    return result[OUTPUT_COLUMNS], None
+        if len(inv_raw) > 8:
+            raise ValueError(
+                f"Inventory ID is too long on source Excel row {source_row_number}: "
+                f"{inv_raw!r}."
+            )
 
+        valid_records.append({
+            VENDOR_COLUMN: str(row[VENDOR_COLUMN]).strip(),
+            PO_COLUMN: po_raw.zfill(6),
+            INVENTORY_COLUMN: inv_raw.zfill(8),
+        })
+
+    output = pd.DataFrame(
+        valid_records,
+        columns=[VENDOR_COLUMN, PO_COLUMN, INVENTORY_COLUMN],
+    )
+    output["Row Number"] = range(1, len(output) + 1)
+    output = output[OUTPUT_COLUMNS]
+
+    exceptions = pd.DataFrame(exception_records, columns=original_columns)
+    return output, "OK", exceptions
 
 def make_excel(df):
     buffer = io.BytesIO()
@@ -273,7 +286,7 @@ if uploaded:
             type="primary",
             use_container_width=True,
         ):
-            result, status = transform(source, vendor_id)
+            result, status, exceptions = transform(source, vendor_id)
 
             if status == "VENDOR_REQUIRED":
                 st.error("Please enter the Vendor ID before creating the file.")
@@ -281,8 +294,46 @@ if uploaded:
                 output_bytes = make_excel(result)
 
                 st.success(
-                    f"Ready! {len(result):,} row(s) were validated and formatted."
+                    f"Ready! {len(result):,} row(s) are ready for Acumatica."
                 )
+
+                if exceptions is not None and not exceptions.empty:
+                    st.warning(
+                        f"{len(exceptions):,} row(s) were excluded because the "
+                        "Drop-Ship PO Nbr: contains a non-numeric character "
+                        "or is longer than 6 digits."
+                    )
+
+                    exception_bytes = make_excel(exceptions)
+                    exception_name = (
+                        Path(uploaded.name).stem
+                        + "_PO_Exceptions.xlsx"
+                    )
+
+                    st.download_button(
+                        "⬇️ Download PO Exception Rows",
+                        data=exception_bytes,
+                        file_name=exception_name,
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "spreadsheetml.sheet"
+                        ),
+                        use_container_width=True,
+                    )
+
+                    st.caption(
+                        "This file contains the complete original rows for the "
+                        "excluded records. They are not included in the "
+                        "Acumatica import file."
+                    )
+
+                    st.dataframe(
+                        exceptions,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No PO exception rows were found.")
 
                 st.dataframe(
                     result,
